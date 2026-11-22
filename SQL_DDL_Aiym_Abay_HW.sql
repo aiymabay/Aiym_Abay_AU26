@@ -1,5 +1,14 @@
 /*
-   DIFFERENCES FROM THE LOGICAL MODEL (also shown in the updated diagram)
+     HOW TO RUN
+     Run the whole file with psql, for example:
+       psql -U postgres -d postgres -f SQL_DDL_Aiym_Abay_HW.sql
+     STEP 0 creates the database (only if it does not exist yet) and connects to it, then the
+     rest of the script builds the schema, tables, indexes and sample data inside it.
+     The script can be run any number of times: every object is created with IF NOT EXISTS and
+     every INSERT is protected with ON CONFLICT DO NOTHING or WHERE NOT EXISTS, so a rerun gives
+     no errors and no duplicates.
+
+   DIFFERENCES FROM THE LOGICAL MODEL (shown in red in DB_Aiym_Abay_HW_RecruitmentAgency_diagram_upd.png)
      1. record_ts DATE NOT NULL DEFAULT CURRENT_DATE is added to every table (task requirement).
      2. person.full_name is added as a GENERATED ALWAYS AS ... STORED column (task requirement).
         It is calculated only from first_name and last_name of the same row and cannot be
@@ -15,13 +24,29 @@
 */
 
 
-/* STEP 0. DATABASE - run once
-   PostgreSQL has no CREATE DATABASE IF NOT EXISTS and CREATE DATABASE cannot run inside a
-   transaction block, so it is the only statement that cannot be made rerunnable in plain SQL.
-   That is why I kept here as a one-time step.
+/*
+   STEP 0. DATABASE
+   PostgreSQL has no CREATE DATABASE IF NOT EXISTS, and CREATE DATABASE cannot run inside a
+   transaction block or a DO block. To keep the statement runnable and rerunnable, the SELECT
+   below builds the CREATE DATABASE command only when the database is missing, and the psql
+   meta-command \gexec executes it. On a rerun the SELECT returns no rows, so nothing is executed.
+   \connect then switches the session to the new database.
 
-   CREATE DATABASE recruitment_agency_db;
+   \gexec and \connect work only in psql. In a GUI client (DBeaver, pgAdmin) run
+   CREATE DATABASE recruitment_agency_db; once on its own, connect to that database and run the
+   script from STEP 1.
 */
+
+SELECT 'CREATE DATABASE recruitment_agency_db'
+WHERE NOT EXISTS (
+	SELECT 1
+	FROM pg_catalog.pg_database pdb
+	WHERE pdb.datname = 'recruitment_agency_db'
+)
+\gexec
+
+\connect recruitment_agency_db
+
 
 /*
    STEP 1. SCHEMA
@@ -34,75 +59,83 @@ CREATE SCHEMA IF NOT EXISTS recruitment_agency;
 
 /*
    STEP 2. TABLES
-   WHY THE ORDER OF DDL MATTERS:
-     A FOREIGN KEY can only reference a table that already exists. So parent tables are created
+
+   WHY THE ORDER OF DDL MATTERS
+     A FOREIGN KEY can only reference a table that already exists, so parent tables are created
      first and child tables after them:
-       	level 0 (no FKs): person, company, city, skill
-       	level 1: candidate, company_representative
-       	level 2: candidate_preferred_location, work_experience, service_usage, job_posting
-       	level 3: service_usage_status_history, candidate_skill, application
-       	level 4: application_status_history, interview, placement
-     
+       level 0 (no FKs) : person, company, city, skill
+       level 1          : candidate, company_representative
+       level 2          : candidate_preferred_location, work_experience, service_usage, job_posting
+       level 3          : service_usage_status_history, candidate_skill, application
+       level 4          : application_status_history, interview, placement
      If the order is wrong, e.g. candidate is created before person, PostgreSQL stops with
-       ERROR: relation "recruitment_agency.person" does not exist  (SQLSTATE 42P01)
-     and the child table is not created at all. 
-     
-     The same rule works backwards for DROP:
+       ERROR: relation "recruitment_agency.person" does not exist (SQLSTATE 42P01)
+     and the child table is not created at all. The same rule works backwards for DROP:
      a parent cannot be dropped while a child references it (SQLSTATE 2BP01).
 
-   DATA TYPES AND THE RISK OF CHOOSING A WRONG ONE:
-     INTEGER identity keys   -2.1 billion values is enough for an agency. SMALLINT could overflow
-                              (32 767 rows); a text key would be slow to join and allow '01' vs '1'.
-     VARCHAR(n)              -names, titles, codes with a known maximum length. Too short a length rejects or cuts valid values; 
-                              storing numbers or dates as text would
-                              allow '31-02-2026' or 'abc' and break sorting and arithmetic.
-     TEXT - descriptions and comments with no natural limit; VARCHAR(n) there would reject long but valid text.
-     CHAR(2) / CHAR(3)       -ISO country and currency codes always have a fixed length.
-     DATE                    -facts where only the day matters (birth, start and end of a period).
-                              TIMESTAMP here would add a meaningless time part and make
-                              comparisons like end_date >= start_date depend on hours.
-     TIMESTAMPTZ             -moments of events (applied, changed, scheduled). TIMESTAMP without
-                              time zone would shift the moment for users in another time zone
-                              and could reorder a status history.
-     NUMERIC(12,2)/(10,2)    -money. REAL / DOUBLE PRECISION are approximate: sums would get
-                              rounding errors (0.1 + 0.2 <> 0.3). INTEGER would lose the tiyn part.
-     SMALLINT                -small counters (level 1-5, round number, minutes); saves space and
-                              documents that the value is small.
-     BOOLEAN                 -yes/no flags. A 'Y'/'N' or 0/1 column would allow a third value.
+   DATA TYPES AND THE RISK OF CHOOSING A WRONG ONE
+     INTEGER identity keys - 2.1 billion values is enough for an agency. SMALLINT could overflow
+                             (32 767 rows); a text key would be slow to join and allow '01' vs '1'.
+     VARCHAR(n)            - names, titles, codes with a known maximum length. Too short a length
+                             rejects valid values; storing numbers or dates as text would allow
+                             '31-02-2026' or 'abc' and break sorting and arithmetic.
+     TEXT                  - descriptions and comments with no natural limit; VARCHAR(n) there
+                             would reject long but valid text.
+     CHAR(2) / CHAR(3)     - ISO country and currency codes always have a fixed length.
+     DATE                  - facts where only the day matters (birth, start and end of a period).
+                             TIMESTAMP here would add a meaningless time part and make
+                             comparisons like end_date >= start_date depend on hours.
+     TIMESTAMPTZ           - moments of events (applied, changed, scheduled). TIMESTAMP without
+                             time zone would shift the moment for users in another time zone
+                             and could reorder a status history.
+     NUMERIC(12,2)/(10,2)  - money. REAL / DOUBLE PRECISION are approximate: sums would get
+                             rounding errors (0.1 + 0.2 <> 0.3). INTEGER would lose the tiyn part.
+     SMALLINT              - small counters (level 1-5, round number, minutes); saves space and
+                             documents that the value is small.
+     BOOLEAN               - yes/no flags. A 'Y'/'N' or 0/1 column would allow a third value.
 
-   WHAT HAPPENS IF A FOREIGN KEY IS MISSING:
-     Without an FK the database does not check that the parent row exists. It would be possible to 
-     insert an application for candidate_id = 999 that does not exist, or to delete a candidate
+   WHAT HAPPENS IF A FOREIGN KEY IS MISSING
+     Without an FK the database does not check that the parent row exists. It would be possible
+     to insert an application for candidate_id = 999 that does not exist, or to delete a candidate
      and leave his applications, skills and interviews behind as "orphan" rows. JOINs would then
      silently lose such rows, counts in reports would not match, and nobody would get an error.
-    
-     With the FK the wrong INSERT/DELETE is rejected (SQLSTATE 23503). All FKs below use the default
-     ON DELETE NO ACTION: the model keeps history, so a parent with children must not disappear.
+     With the FK the wrong INSERT or DELETE is rejected (SQLSTATE 23503). All FKs below use the
+     default ON DELETE NO ACTION: the model keeps history, so a parent with children must not
+     disappear.
 
-   names:
+   PRIMARY KEYS
+     Every table has a PRIMARY KEY (NOT NULL + UNIQUE). Without it the same row could be stored
+     twice and a foreign key would have nothing reliable to point to.
+
+   NAMING (EPAM coding standards)
      pk_<table>_<columns>, fk_<table>_<columns>, uq_<table>_<columns>, chk_<table>_<column or rule>.
 */
 
---person: a human the agency knows, independent of role. Level 0, no FKs.
---generated column: always equal to first_name + last_name, cannot be inserted or updated by hand.
+-- person: a human the agency knows, independent of role. Level 0, no FKs.
+-- NOT NULL on first_name, last_name, email: prevents "empty" persons that cannot be identified
+-- or contacted. Without it a row with only an id could exist and be linked to applications.
 CREATE TABLE IF NOT EXISTS recruitment_agency.person (
-	person_id INTEGER GENERATED ALWAYS AS IDENTITY,
-	first_name VARCHAR(50) NOT NULL,
-	last_name VARCHAR(50) NOT NULL,
+	person_id       INTEGER         GENERATED ALWAYS AS IDENTITY,
+	first_name      VARCHAR(50)     NOT NULL,
+	last_name       VARCHAR(50)     NOT NULL,
+	-- Generated column: always equal to first_name + ' ' + last_name, cannot be written by hand.
 	full_name       VARCHAR(101)    GENERATED ALWAYS AS (first_name || ' ' || last_name) STORED,
 	email           VARCHAR(150)    NOT NULL,
 	phone           VARCHAR(20),
 	date_of_birth   DATE,
 	created_at      TIMESTAMPTZ     NOT NULL DEFAULT now(),
 	CONSTRAINT pk_person_person_id PRIMARY KEY (person_id),
-	--UNIQUE: prevents the same human being registered twice. Without it one person could get two rows and his applications and roles would be split between them.
+	-- UNIQUE: prevents the same human being registered twice. Without it one person could get
+	-- two rows and his applications and roles would be split between them.
 	CONSTRAINT uq_person_email UNIQUE (email),
-	-- CHECK: prevents a birth date in the future (typing mistake like 2099). Without it the age of a candidate could be negative.
+	-- CHECK: prevents a birth date in the future (a typing mistake like 2099). Without it the
+	-- age of a candidate could be negative.
 	CONSTRAINT chk_person_date_of_birth CHECK (date_of_birth < CURRENT_DATE)
 );
---NOT NULL on first_name, last_name, email: prevents "empty" persons that cannot be identified or contacted. Without it a row with only an id could exist and be linked to applications.
 
 -- company: a client company that posts jobs. Level 0, no FKs.
+-- NOT NULL on company_name, industry, is_active, created_at: a client without a name or
+-- industry cannot be shown in any report.
 CREATE TABLE IF NOT EXISTS recruitment_agency.company (
 	company_id              INTEGER         GENERATED ALWAYS AS IDENTITY,
 	company_name            VARCHAR(200)    NOT NULL,
@@ -112,25 +145,29 @@ CREATE TABLE IF NOT EXISTS recruitment_agency.company (
 	is_active               BOOLEAN         NOT NULL DEFAULT TRUE,
 	created_at              TIMESTAMPTZ     NOT NULL DEFAULT now(),
 	CONSTRAINT pk_company_company_id PRIMARY KEY (company_id),
-	-- UNIQUE: the BIN identifies one legal entity. Without it the same company could be entered twice and its postings and fees would be split between two rows.
+	-- UNIQUE: the BIN identifies one legal entity. Without it the same company could be entered
+	-- twice and its postings and fees would be split between two rows.
 	-- VARCHAR, not a number: a BIN can start with 0 ('050240009876') and a numeric type would drop it.
 	CONSTRAINT uq_company_registration_number UNIQUE (registration_number)
 );
 
 -- city: a city in a country, shared by preferred locations and job postings. Level 0, no FKs.
+-- NOT NULL on city_name, country_code: a city without a name or country cannot be matched.
 CREATE TABLE IF NOT EXISTS recruitment_agency.city (
 	city_id         INTEGER         GENERATED ALWAYS AS IDENTITY,
 	city_name       VARCHAR(100)    NOT NULL,
 	country_code    CHAR(2)         NOT NULL,
 	CONSTRAINT pk_city_city_id PRIMARY KEY (city_id),
-	-- UNIQUE: one row per city in a country. Without it 'Almaty, KZ' could exist several times and candidates and postings for the same city would not match each other.
+	-- UNIQUE: one row per city in a country. Without it 'Almaty, KZ' could exist several times
+	-- and candidates and postings for the same city would not match each other.
 	CONSTRAINT uq_city_city_name_country_code UNIQUE (city_name, country_code),
-	--CHECK: only two capital letters (ISO 3166-1 alpha-2). Prevents 'kz', 'K1' or 'K '.
-	--without it the same country could be written in several ways.
+	-- CHECK: only two capital letters (ISO 3166-1 alpha-2). Prevents 'kz', 'K1' or 'K '.
+	-- Without it the same country could be written in several ways.
 	CONSTRAINT chk_city_country_code CHECK (country_code ~ '^[A-Z]{2}$')
 );
 
 -- skill: catalogue of skills. Level 0, no FKs.
+-- NOT NULL on skill_name, skill_category: a skill without a name or group is useless for search.
 CREATE TABLE IF NOT EXISTS recruitment_agency.skill (
 	skill_id        INTEGER         GENERATED ALWAYS AS IDENTITY,
 	skill_name      VARCHAR(100)    NOT NULL,
@@ -144,7 +181,9 @@ CREATE TABLE IF NOT EXISTS recruitment_agency.skill (
 	CONSTRAINT chk_skill_skill_category CHECK (skill_category IN ('technical', 'language', 'soft'))
 );
 
---candidate: the job-seeker role of a person. Level 1, parent: person.
+-- candidate: the job-seeker role of a person. Level 1, parent: person.
+-- NOT NULL on person_id, source, registered_at: a profile must belong to a person and say how
+-- and when the candidate came to the agency.
 CREATE TABLE IF NOT EXISTS recruitment_agency.candidate (
 	candidate_id    INTEGER         GENERATED ALWAYS AS IDENTITY,
 	person_id       INTEGER         NOT NULL,
@@ -154,16 +193,21 @@ CREATE TABLE IF NOT EXISTS recruitment_agency.candidate (
 	CONSTRAINT pk_candidate_candidate_id PRIMARY KEY (candidate_id),
 	CONSTRAINT fk_candidate_person_id FOREIGN KEY (person_id)
 		REFERENCES recruitment_agency.person (person_id),
-	--UNIQUE: one person has at most one candidate profile (1 : 0..1). Without it a person could have two profiles with different CVs and applications.
+	-- UNIQUE: one person has at most one candidate profile (1 : 0..1). Without it a person could
+	-- have two profiles with different CVs and applications.
 	CONSTRAINT uq_candidate_person_id UNIQUE (person_id),
-	-- CHECK (specific values): only the four known channels. Without it 'web', 'Website' and 'website' would be counted as different sources in marketing reports.
+	-- CHECK (specific values): only the four known channels. Without it 'web', 'Website' and
+	-- 'website' would be counted as different sources in marketing reports.
 	CONSTRAINT chk_candidate_source CHECK (source IN ('website', 'referral', 'job_board', 'social_media')),
-	--CHECK (date > 2000-01-01): prevents placeholder or mistyped dates like 1900-01-01 or 0026-03-02.
-	--without it "candidates registered per year" would show impossible years.
+	-- CHECK (date > 2000-01-01): prevents placeholder or mistyped dates like 1900-01-01 or
+	-- 0026-03-02. Without it "candidates registered per year" would show impossible years.
 	CONSTRAINT chk_candidate_registered_at CHECK (registered_at > TIMESTAMPTZ '2000-01-01 00:00:00+00')
 );
 
--- company_representative: a person acting for a company during a period. Level 1, parents: person, company.
+-- company_representative: a person acting for a company during a period.
+-- Level 1, parents: person, company.
+-- NOT NULL on person_id, company_id, job_title, start_date: a representation is meaningless
+-- without who, for which company, in which role and since when.
 CREATE TABLE IF NOT EXISTS recruitment_agency.company_representative (
 	company_representative_id   INTEGER         GENERATED ALWAYS AS IDENTITY,
 	person_id                   INTEGER         NOT NULL,
@@ -176,29 +220,40 @@ CREATE TABLE IF NOT EXISTS recruitment_agency.company_representative (
 		REFERENCES recruitment_agency.person (person_id),
 	CONSTRAINT fk_company_representative_company_id FOREIGN KEY (company_id)
 		REFERENCES recruitment_agency.company (company_id),
-	--UNIQUE: the same person cannot start representing the same company twice on one day.
+	-- UNIQUE: the same person cannot start representing the same company twice on one day.
+	-- Without it one period could be entered twice and interviews split between the copies.
 	CONSTRAINT uq_company_representative_person_id_company_id_start_date UNIQUE (person_id, company_id, start_date),
-	--CHECK: a period cannot end before it starts. Without it the length of a period would be negative and "who represented the company on date X" would give wrong answers.
+	-- CHECK: a period cannot end before it starts. Without it the length of a period would be
+	-- negative and "who represented the company on date X" would give wrong answers.
 	CONSTRAINT chk_company_representative_end_date CHECK (end_date >= start_date)
 );
 
--- candidate_preferred_location: a city where a candidate wants to work, for a period. Level 2, parents: candidate, city.
+-- candidate_preferred_location: a city where a candidate wants to work, for a period.
+-- Level 2, parents: candidate, city.
+-- NOT NULL on is_remote_ok: the flag is always known (DEFAULT FALSE), so filters never meet NULL.
 CREATE TABLE IF NOT EXISTS recruitment_agency.candidate_preferred_location (
 	candidate_id    INTEGER     NOT NULL,
 	city_id         INTEGER     NOT NULL,
 	valid_from      DATE        NOT NULL DEFAULT CURRENT_DATE,
 	valid_to        DATE,
 	is_remote_ok    BOOLEAN     NOT NULL DEFAULT FALSE,
-	-- Composite PK: the same city can be preferred again later, so the start date is part of the key.
+	-- Composite PK: one candidate, city and start date is one preference. The start date is part
+	-- of the key because the same city can be preferred again later. Without it the same
+	-- preference could be stored twice.
 	CONSTRAINT pk_candidate_preferred_location_candidate_id_city_id_valid_from PRIMARY KEY (candidate_id, city_id, valid_from),
 	CONSTRAINT fk_candidate_preferred_location_candidate_id FOREIGN KEY (candidate_id)
 		REFERENCES recruitment_agency.candidate (candidate_id),
 	CONSTRAINT fk_candidate_preferred_location_city_id FOREIGN KEY (city_id)
 		REFERENCES recruitment_agency.city (city_id),
+	-- CHECK: a preference cannot end before it starts. Without it a candidate could have a
+	-- preference with a negative period, and "which city does the candidate prefer today" would
+	-- return a row that was never valid.
 	CONSTRAINT chk_candidate_preferred_location_valid_to CHECK (valid_to >= valid_from)
 );
 
 -- work_experience: one past or current job of a candidate. Level 2, parent: candidate.
+-- NOT NULL on candidate_id, employer_name, job_title, start_date: a job without an employer,
+-- title or start cannot be shown in a CV.
 CREATE TABLE IF NOT EXISTS recruitment_agency.work_experience (
 	work_experience_id  INTEGER         GENERATED ALWAYS AS IDENTITY,
 	candidate_id        INTEGER         NOT NULL,
@@ -210,11 +265,14 @@ CREATE TABLE IF NOT EXISTS recruitment_agency.work_experience (
 	CONSTRAINT pk_work_experience_work_experience_id PRIMARY KEY (work_experience_id),
 	CONSTRAINT fk_work_experience_candidate_id FOREIGN KEY (candidate_id)
 		REFERENCES recruitment_agency.candidate (candidate_id),
-	--CHECK: a job cannot end before it starts; otherwise years of experience would be negative.
+	-- CHECK: a job cannot end before it starts. Without it years of experience would be negative.
 	CONSTRAINT chk_work_experience_end_date CHECK (end_date >= start_date)
 );
 
--- service_usage: one resume advice, coaching or skills testing service for a candidate. Level 2, parent: candidate. Created before candidate_skill, which references it.
+-- service_usage: one resume advice, coaching or skills testing service for a candidate.
+-- Level 2, parent: candidate. Created before candidate_skill, which references it.
+-- NOT NULL on candidate_id, service_type, requested_at, price_charged, currency_code: every
+-- service has a receiver, a type, a time and a price (0 for free).
 CREATE TABLE IF NOT EXISTS recruitment_agency.service_usage (
 	service_usage_id    INTEGER         GENERATED ALWAYS AS IDENTITY,
 	candidate_id        INTEGER         NOT NULL,
@@ -225,32 +283,44 @@ CREATE TABLE IF NOT EXISTS recruitment_agency.service_usage (
 	CONSTRAINT pk_service_usage_service_usage_id PRIMARY KEY (service_usage_id),
 	CONSTRAINT fk_service_usage_candidate_id FOREIGN KEY (candidate_id)
 		REFERENCES recruitment_agency.candidate (candidate_id),
-	--CHECK (specific values): the agency offers exactly three services.
+	-- CHECK (specific values): the agency offers exactly three services. Without it a typo like
+	-- 'coachng' would create a fourth "service" and revenue per service would be wrong.
 	CONSTRAINT chk_service_usage_service_type CHECK (service_type IN ('resume_advice', 'coaching', 'skills_testing')),
-	--CHECK (date > 2000-01-01): same reason as candidate.registered_at.
+	-- CHECK (date > 2000-01-01): same reason as candidate.registered_at.
 	CONSTRAINT chk_service_usage_requested_at CHECK (requested_at > TIMESTAMPTZ '2000-01-01 00:00:00+00'),
-	--CHECK (measured value not negative): a price of -15000 would reduce the revenue total instead of increasing it. 0 is allowed and means a free service.
+	-- CHECK (measured value not negative): a price of -15000 would reduce the revenue total
+	-- instead of increasing it. 0 is allowed and means a free service.
 	CONSTRAINT chk_service_usage_price_charged CHECK (price_charged >= 0),
-	--CHECK: three capital letters (ISO 4217). Prevents 'kzt', 'KZ', 'tg'; without it sums per currency would be split between several spellings.
+	-- CHECK: three capital letters (ISO 4217). Prevents 'kzt', 'KZ', 'tg'. Without it sums per
+	-- currency would be split between several spellings.
 	CONSTRAINT chk_service_usage_currency_code CHECK (currency_code ~ '^[A-Z]{3}$')
 );
 
--- service_usage_status_history: every status change of a service usage (insert-only). Level 3, parent: service_usage.
+-- service_usage_status_history: every status change of a service usage (insert-only).
+-- Level 3, parent: service_usage.
+-- NOT NULL on service_usage_id, status, changed_at: a history row must say which service,
+-- which status and when.
 CREATE TABLE IF NOT EXISTS recruitment_agency.service_usage_status_history (
 	service_usage_status_history_id     INTEGER         GENERATED ALWAYS AS IDENTITY,
 	service_usage_id                    INTEGER         NOT NULL,
 	status                              VARCHAR(20)     NOT NULL,
 	changed_at                          TIMESTAMPTZ     NOT NULL DEFAULT now(),
 	note                                TEXT,
-	CONSTRAINT pk_service_usage_status_history_id PRIMARY KEY (service_usage_status_history_id),
+	CONSTRAINT pk_service_usage_status_history_service_usage_status_history_id PRIMARY KEY (service_usage_status_history_id),
 	CONSTRAINT fk_service_usage_status_history_service_usage_id FOREIGN KEY (service_usage_id)
 		REFERENCES recruitment_agency.service_usage (service_usage_id),
-	--UNIQUE: one service cannot have two statuses at the same moment; otherwise the "latest row is the current status" rule would be ambiguous.
+	-- UNIQUE: one service cannot have two statuses at the same moment. Without it the rule
+	-- "the latest row is the current status" would be ambiguous.
 	CONSTRAINT uq_service_usage_status_history_service_usage_id_changed_at UNIQUE (service_usage_id, changed_at),
+	-- CHECK (specific values): only the five steps of a service. Without it 'done', 'Completed'
+	-- or 'finished' could appear and "completed services" would be undercounted.
 	CONSTRAINT chk_service_usage_status_history_status CHECK (status IN ('requested', 'scheduled', 'in_progress', 'completed', 'cancelled'))
 );
 
--- candidate_skill: a dated level of one skill for one candidate (M:N candidate - skill). Level 3, parents: candidate, skill, service_usage.
+-- candidate_skill: a dated level of one skill for one candidate (M:N candidate - skill).
+-- Level 3, parents: candidate, skill, service_usage.
+-- NOT NULL on proficiency_level, assessment_source: a skill row without a level or source
+-- cannot be compared or trusted.
 CREATE TABLE IF NOT EXISTS recruitment_agency.candidate_skill (
 	candidate_id        INTEGER         NOT NULL,
 	skill_id            INTEGER         NOT NULL,
@@ -258,6 +328,8 @@ CREATE TABLE IF NOT EXISTS recruitment_agency.candidate_skill (
 	proficiency_level   SMALLINT        NOT NULL,
 	assessment_source   VARCHAR(20)     NOT NULL,
 	service_usage_id    INTEGER,
+	-- Composite PK: one candidate, skill and date is one assessment. A new assessment is a new
+	-- date, so history is kept. Without it the same assessment could be stored twice.
 	CONSTRAINT pk_candidate_skill_candidate_id_skill_id_assessed_on PRIMARY KEY (candidate_id, skill_id, assessed_on),
 	CONSTRAINT fk_candidate_skill_candidate_id FOREIGN KEY (candidate_id)
 		REFERENCES recruitment_agency.candidate (candidate_id),
@@ -265,15 +337,21 @@ CREATE TABLE IF NOT EXISTS recruitment_agency.candidate_skill (
 		REFERENCES recruitment_agency.skill (skill_id),
 	CONSTRAINT fk_candidate_skill_service_usage_id FOREIGN KEY (service_usage_id)
 		REFERENCES recruitment_agency.service_usage (service_usage_id),
-	--CHECK: the scale is 1 (beginner) to 5 (expert). Prevents 0, -1 or 50; without it the average level and "level >= 4" filters would be meaningless.
+	-- CHECK: the scale is 1 (beginner) to 5 (expert). Prevents 0, -1 or 50. Without it the
+	-- average level and "level >= 4" filters would be meaningless.
 	CONSTRAINT chk_candidate_skill_proficiency_level CHECK (proficiency_level BETWEEN 1 AND 5),
+	-- CHECK (specific values): a level is either self-reported or measured by a test. Without it
+	-- values like 'manager' or 'Self' would appear and "tested skills only" filters would fail.
 	CONSTRAINT chk_candidate_skill_assessment_source CHECK (assessment_source IN ('self_reported', 'skills_test')),
-	--CHECK: a level from a skills test must point to that test, and a self-reported level must not.
-	--without it a "tested" level could exist with no test behind it.
+	-- CHECK: a level from a skills test must point to that test, and a self-reported level must
+	-- not. Without it a "tested" level could exist with no test behind it.
 	CONSTRAINT chk_candidate_skill_source_matches_service CHECK ((assessment_source = 'skills_test') = (service_usage_id IS NOT NULL))
 );
 
--- job_posting: a job a company asks the agency to fill. Level 2, parents: company, city and itself (previous version of the posting).
+-- job_posting: a job a company asks the agency to fill.
+-- Level 2, parents: company, city and itself (previous version of the posting).
+-- NOT NULL on company_id, city_id, job_title, employment_type, currency_code, posted_at: a
+-- posting must say who offers what job, where, on which terms and since when.
 CREATE TABLE IF NOT EXISTS recruitment_agency.job_posting (
 	job_posting_id              INTEGER         GENERATED ALWAYS AS IDENTITY,
 	company_id                  INTEGER         NOT NULL,
@@ -290,27 +368,35 @@ CREATE TABLE IF NOT EXISTS recruitment_agency.job_posting (
 	CONSTRAINT pk_job_posting_job_posting_id PRIMARY KEY (job_posting_id),
 	CONSTRAINT fk_job_posting_company_id FOREIGN KEY (company_id)
 		REFERENCES recruitment_agency.company (company_id),
-	--Self-reference: the parent row is in the same table, so the table already exists when
-	--the FK is checked. The old posting must be inserted before the one that replaces it.
+	-- Self-reference: the parent row is in the same table, so the table already exists when the
+	-- FK is checked. The old posting must be inserted before the one that replaces it.
 	CONSTRAINT fk_job_posting_previous_job_posting_id FOREIGN KEY (previous_job_posting_id)
 		REFERENCES recruitment_agency.job_posting (job_posting_id),
 	CONSTRAINT fk_job_posting_city_id FOREIGN KEY (city_id)
 		REFERENCES recruitment_agency.city (city_id),
-	--UNIQUE: a posting can be replaced by only one new posting, so versions form a chain, not a tree.
+	-- UNIQUE: a posting can be replaced by only one new posting, so versions form a chain, not a
+	-- tree. Without it two "current" versions of the same job could exist at once.
 	CONSTRAINT uq_job_posting_previous_job_posting_id UNIQUE (previous_job_posting_id),
-	--CHECK: a posting cannot replace itself.
+	-- CHECK: a posting cannot replace itself. Without it the version chain could loop forever.
 	CONSTRAINT chk_job_posting_previous_job_posting_id CHECK (previous_job_posting_id <> job_posting_id),
+	-- CHECK (specific values): only the four contract forms. Without it 'fulltime', 'Full-time'
+	-- and 'full_time' would be different groups and a "full-time jobs" filter would miss postings.
 	CONSTRAINT chk_job_posting_employment_type CHECK (employment_type IN ('full_time', 'part_time', 'contract', 'internship')),
-	--CHECK (measured value not negative): a negative salary is impossible.
+	-- CHECK (measured value not negative): a negative salary is impossible.
 	CONSTRAINT chk_job_posting_salary_min CHECK (salary_min >= 0),
-	--CHECK: the upper bound cannot be below the lower bound; otherwise no expected salary could ever fall inside the range.
+	-- CHECK: the upper bound cannot be below the lower bound. Without it no expected salary could
+	-- ever fall inside the range and salary matching would return nothing.
 	CONSTRAINT chk_job_posting_salary_max CHECK (salary_max >= salary_min),
+	-- CHECK: three capital letters (ISO 4217), same reason as service_usage.currency_code.
 	CONSTRAINT chk_job_posting_currency_code CHECK (currency_code ~ '^[A-Z]{3}$'),
-	--CHECK (date > 2000-01-01): same reason as candidate.registered_at.
+	-- CHECK (date > 2000-01-01): same reason as candidate.registered_at.
 	CONSTRAINT chk_job_posting_posted_at CHECK (posted_at > TIMESTAMPTZ '2000-01-01 00:00:00+00')
 );
 
--- application: a candidate applying to one posting (M:N candidate - job_posting). Level 3, parents: candidate, job_posting.
+-- application: a candidate applying to one posting (M:N candidate - job_posting).
+-- Level 3, parents: candidate, job_posting.
+-- NOT NULL on candidate_id, job_posting_id, applied_at: an application links one candidate to
+-- one posting at a known time.
 CREATE TABLE IF NOT EXISTS recruitment_agency.application (
 	application_id      INTEGER         GENERATED ALWAYS AS IDENTITY,
 	candidate_id        INTEGER         NOT NULL,
@@ -323,30 +409,42 @@ CREATE TABLE IF NOT EXISTS recruitment_agency.application (
 		REFERENCES recruitment_agency.candidate (candidate_id),
 	CONSTRAINT fk_application_job_posting_id FOREIGN KEY (job_posting_id)
 		REFERENCES recruitment_agency.job_posting (job_posting_id),
-	--UNIQUE: a candidate applies to a posting only once. Without it a double click would create
-	--two applications with two separate status histories.
+	-- UNIQUE: a candidate applies to a posting only once. Without it a double click would create
+	-- two applications with two separate status histories.
 	CONSTRAINT uq_application_candidate_id_job_posting_id UNIQUE (candidate_id, job_posting_id),
+	-- CHECK (date > 2000-01-01): same reason as candidate.registered_at.
 	CONSTRAINT chk_application_applied_at CHECK (applied_at > TIMESTAMPTZ '2000-01-01 00:00:00+00'),
+	-- CHECK (measured value not negative): a negative salary request is impossible and would
+	-- break average expected salary reports.
 	CONSTRAINT chk_application_expected_salary CHECK (expected_salary >= 0)
 );
 
--- application_status_history: every status change of an application. Level 4, parent: application.
+-- application_status_history: every status change of an application (insert-only).
+-- Level 4, parent: application.
+-- NOT NULL on application_id, status, changed_at: a history row must say which application,
+-- which status and when.
 CREATE TABLE IF NOT EXISTS recruitment_agency.application_status_history (
 	application_status_history_id   INTEGER         GENERATED ALWAYS AS IDENTITY,
 	application_id                  INTEGER         NOT NULL,
 	status                          VARCHAR(20)     NOT NULL,
 	changed_at                      TIMESTAMPTZ     NOT NULL DEFAULT now(),
 	comment                         TEXT,
-	CONSTRAINT pk_application_status_history_id PRIMARY KEY (application_status_history_id),
+	CONSTRAINT pk_application_status_history_application_status_history_id PRIMARY KEY (application_status_history_id),
 	CONSTRAINT fk_application_status_history_application_id FOREIGN KEY (application_id)
 		REFERENCES recruitment_agency.application (application_id),
+	-- UNIQUE: one application cannot get two statuses at the same moment. Without it the rule
+	-- "the latest row is the current status" would be ambiguous.
 	CONSTRAINT uq_application_status_history_application_id_changed_at UNIQUE (application_id, changed_at),
 	-- CHECK (specific values): only the six steps of the process. Without it 'Approved', 'ok'
 	-- or 'hired' could appear and the funnel report would miss those applications.
 	CONSTRAINT chk_application_status_history_status CHECK (status IN ('submitted', 'under_review', 'interview', 'approved', 'rejected', 'withdrawn'))
 );
 
--- interview: one interview round between a candidate and a company representative. Level 4, parents: application, company_representative.
+-- interview: one interview round between a candidate and a company representative.
+-- Level 4, parents: application, company_representative.
+-- NOT NULL on application_id, company_representative_id, round_number, interview_type,
+-- scheduled_at, outcome: an interview must have a candidate, an interviewer, a round, a format,
+-- a time and a result (DEFAULT 'pending' until it happens).
 CREATE TABLE IF NOT EXISTS recruitment_agency.interview (
 	interview_id                INTEGER         GENERATED ALWAYS AS IDENTITY,
 	application_id              INTEGER         NOT NULL,
@@ -362,17 +460,27 @@ CREATE TABLE IF NOT EXISTS recruitment_agency.interview (
 		REFERENCES recruitment_agency.application (application_id),
 	CONSTRAINT fk_interview_company_representative_id FOREIGN KEY (company_representative_id)
 		REFERENCES recruitment_agency.company_representative (company_representative_id),
-	-- UNIQUE: an application has only one round number 1, one round number 2 and so on.
+	-- UNIQUE: an application has only one round number 1, one round number 2 and so on. Without
+	-- it two different "round 2" rows could exist and the order of rounds would be unclear.
 	CONSTRAINT uq_interview_application_id_round_number UNIQUE (application_id, round_number),
+	-- CHECK: rounds are counted from 1. Prevents 0 or -1, which would break "first round"
+	-- queries and the order of rounds.
 	CONSTRAINT chk_interview_round_number CHECK (round_number > 0),
+	-- CHECK (specific values): only the four interview formats. Without it 'Zoom', 'call' or
+	-- 'videocall' would appear and statistics per format would be split.
 	CONSTRAINT chk_interview_interview_type CHECK (interview_type IN ('phone', 'video', 'onsite', 'technical')),
+	-- CHECK (date > 2000-01-01): same reason as candidate.registered_at.
 	CONSTRAINT chk_interview_scheduled_at CHECK (scheduled_at > TIMESTAMPTZ '2000-01-01 00:00:00+00'),
 	-- CHECK (measured value): an interview cannot last 0 or -30 minutes.
 	CONSTRAINT chk_interview_duration_minutes CHECK (duration_minutes > 0),
+	-- CHECK (specific values): only the five known results. Without it 'ok', 'Passed' or 'good'
+	-- would appear and the pass rate of interviews could not be calculated.
 	CONSTRAINT chk_interview_outcome CHECK (outcome IN ('pending', 'passed', 'failed', 'no_show', 'cancelled'))
 );
 
 -- placement: hiring outcome of a successful application (1 : 0..1). Level 4, parent: application.
+-- NOT NULL on application_id, start_date, agreed_salary, currency_code, fee_amount: a hire is
+-- not complete without the start, the salary and the agency fee.
 CREATE TABLE IF NOT EXISTS recruitment_agency.placement (
 	placement_id    INTEGER         GENERATED ALWAYS AS IDENTITY,
 	application_id  INTEGER         NOT NULL,
@@ -385,24 +493,28 @@ CREATE TABLE IF NOT EXISTS recruitment_agency.placement (
 	CONSTRAINT pk_placement_placement_id PRIMARY KEY (placement_id),
 	CONSTRAINT fk_placement_application_id FOREIGN KEY (application_id)
 		REFERENCES recruitment_agency.application (application_id),
-	--UNIQUE: one application gives at most one hire. Without it the same hire could be entered twice and the agency fee would be counted twice.
+	-- UNIQUE: one application gives at most one hire. Without it the same hire could be entered
+	-- twice and the agency fee would be counted twice.
 	CONSTRAINT uq_placement_application_id UNIQUE (application_id),
-	--CHECK (date > 2000-01-01): prevents mistyped years (1026, 0001) in the first working day.
+	-- CHECK (date > 2000-01-01): prevents mistyped years (1026, 0001) in the first working day.
 	CONSTRAINT chk_placement_start_date CHECK (start_date > DATE '2000-01-01'),
+	-- CHECK (measured value positive): a hire with a salary of 0 or less is a data entry error.
 	CONSTRAINT chk_placement_agreed_salary CHECK (agreed_salary > 0),
+	-- CHECK: three capital letters (ISO 4217), same reason as service_usage.currency_code.
 	CONSTRAINT chk_placement_currency_code CHECK (currency_code ~ '^[A-Z]{3}$'),
-	--CHECK (measured value not negative): a negative fee would mean the agency pays the client.
+	-- CHECK (measured value not negative): a negative fee would mean the agency pays the client.
 	CONSTRAINT chk_placement_fee_amount CHECK (fee_amount >= 0),
+	-- CHECK: employment cannot end before it starts. Without it the length of a placement would
+	-- be negative.
 	CONSTRAINT chk_placement_end_date CHECK (end_date >= start_date)
 );
 
 
 /*
    STEP 3. INDEXES
-   
    PostgreSQL creates an index for every PRIMARY KEY and UNIQUE constraint, but not for a
-   FOREIGN KEY. The FK columns below are not the first column of any PK/UNIQUE index, so joins
-   to the parent and FK checks on parent DELETE would scan the whole child table without them.
+   FOREIGN KEY. The FK columns below are not the first column of any PK or UNIQUE index, so
+   joins to the parent and FK checks on parent DELETE would scan the whole child table without them.
 */
 
 CREATE INDEX IF NOT EXISTS idx_company_representative_company_id
@@ -436,26 +548,35 @@ CREATE INDEX IF NOT EXISTS idx_interview_company_representative_id
 	ON recruitment_agency.interview (company_representative_id);
 
 
-/*   STEP 4. SAMPLE DATA
+/*
+   STEP 4. SAMPLE DATA
 
    HOW CONSISTENCY IS ENSURED AND RELATIONSHIPS ARE PRESERVED
      1. Same order as the DDL: parents are inserted before children, so every FK value exists.
-     2. Identity values are generated by the database and can differ between
+     2. No hardcoded ids. Identity values are generated by the database and can differ between
         runs and environments, so a child row never contains a literal like candidate_id = 1.
-        Each INSERT finds the parent id by its natural key (person.email, company.registration_number,
-        city name + country, skill_name, ...) with an INNER JOIN. If a parent is missing, the join
-        returns no row and nothing is inserted, instead of inserting a wrong or orphan row.
-     3. No duplicates on rerun:
-          -tables with a UNIQUE / PK natural key use ON CONFLICT DO NOTHING;
-          -tables without one (work_experience, service_usage, job_posting) use WHERE NOT EXISTS.
+        Each INSERT finds the parent id by its natural key (person.email,
+        company.registration_number, city name + country, skill_name, ...) with an INNER JOIN.
+        If a parent is missing, the join returns no row and nothing is inserted, instead of
+        inserting a wrong or orphan row.
+     3. Text comparisons are case-insensitive: every join and filter on a text column compares
+        LOWER() (UPPER() for codes) of both sides, so 'Aigerim.T@mail.kz' and 'aigerim.t@mail.kz'
+        or 'sql' and 'SQL' are treated as the same value and are not inserted twice.
+     4. No duplicates on rerun:
+          - tables with a UNIQUE or PK natural key use ON CONFLICT DO NOTHING;
+          - person, city and skill also use WHERE NOT EXISTS with LOWER(), because a UNIQUE
+            constraint compares text case-sensitively and would let 'SQL' and 'sql' both in;
+          - tables without a natural key (work_experience, service_usage, job_posting) use
+            WHERE NOT EXISTS.
         For the same reason event times are written explicitly instead of using DEFAULT now():
         with now() every rerun would produce a "new" row that the UNIQUE key cannot recognise.
-        Time zone (+05, Almaty) is written explicitly, so the result does not depend on the session.
-     4. Columns with DEFAULT (is_active, currency_code, is_remote_ok, price_charged) are left out of
-        the column list where the default is the wanted value, so the defaults are really used.
-     5. The interviewer is found through the company of the posting and the dates of his
-        representation period, so an interview cannot be linked to a representative of another company.
-     6. All inserts run in one transaction: either the whole consistent data set is loaded or nothing.
+        The time zone (+05, Almaty) is written explicitly, so the result does not depend on the session.
+     5. Columns with DEFAULT (is_active, currency_code, is_remote_ok) are left out of the column
+        list where the default is the wanted value, so the defaults are really used.
+     6. The interviewer is found through the company of the posting and the dates of his
+        representation period, so an interview cannot be linked to a representative of another
+        company.
+     7. All inserts run in one transaction: either the whole consistent data set is loaded or nothing.
 */
 
 BEGIN;
@@ -469,11 +590,16 @@ SELECT  src.first_name,
 		src.date_of_birth,
 		src.created_at
 FROM (
-	VALUES  ('Aigerim',   'Tulegen',   'aigerim.t@mail.kz',     '+77071234567', DATE '1999-05-12', TIMESTAMPTZ '2026-03-02 09:00:00+05'),
-			('Nursultan', 'Ermekov',   'n.ermekov@gmail.com',   '+77077654321', DATE '1996-11-30', TIMESTAMPTZ '2026-04-18 09:00:00+05'),
-			('Aruzhan',   'Seitkali',  'aruzhan.s@gmail.com',   '+77011112233', DATE '1990-02-07', TIMESTAMPTZ '2024-02-01 09:00:00+05'),
-			('Dauren',    'Akhmetov',  'd.akhmetov@tengri.kz',  '+77015556677', DATE '1988-07-19', TIMESTAMPTZ '2025-11-01 09:00:00+05')
+	VALUES  ('Aigerim',   'Tulegen',  'aigerim.t@mail.kz',    '+77071234567', DATE '1999-05-12', TIMESTAMPTZ '2026-03-02 09:00:00+05'),
+			('Nursultan', 'Ermekov',  'n.ermekov@gmail.com',  '+77077654321', DATE '1996-11-30', TIMESTAMPTZ '2026-04-18 09:00:00+05'),
+			('Aruzhan',   'Seitkali', 'aruzhan.s@gmail.com',  '+77011112233', DATE '1990-02-07', TIMESTAMPTZ '2024-02-01 09:00:00+05'),
+			('Dauren',    'Akhmetov', 'd.akhmetov@tengri.kz', '+77015556677', DATE '1988-07-19', TIMESTAMPTZ '2025-11-01 09:00:00+05')
 ) AS src (first_name, last_name, email, phone, date_of_birth, created_at)
+WHERE NOT EXISTS (
+	SELECT 1
+	FROM recruitment_agency.person per
+	WHERE LOWER(per.email) = LOWER(src.email)
+)
 ON CONFLICT (email) DO NOTHING;
 
 -- company (2 rows); is_active uses its DEFAULT TRUE
@@ -487,6 +613,11 @@ FROM (
 	VALUES  ('Kaspi Tech',       '990140001234', 'FinTech',   'kaspi.kz',  TIMESTAMPTZ '2026-01-10 09:00:00+05'),
 			('Tengri Logistics', '050240009876', 'Logistics', 'tengri.kz', TIMESTAMPTZ '2024-01-15 09:00:00+05')
 ) AS src (company_name, registration_number, industry, website_url, created_at)
+WHERE NOT EXISTS (
+	SELECT 1
+	FROM recruitment_agency.company com
+	WHERE UPPER(com.registration_number) = UPPER(src.registration_number)
+)
 ON CONFLICT (registration_number) DO NOTHING;
 
 -- city (3 rows)
@@ -498,6 +629,12 @@ FROM (
 			('Almaty',   'KZ'),
 			('Tashkent', 'UZ')
 ) AS src (city_name, country_code)
+WHERE NOT EXISTS (
+	SELECT 1
+	FROM recruitment_agency.city cit
+	WHERE LOWER(cit.city_name)    = LOWER(src.city_name) AND
+		  UPPER(cit.country_code) = UPPER(src.country_code)
+)
 ON CONFLICT (city_name, country_code) DO NOTHING;
 
 -- skill (3 rows)
@@ -509,6 +646,11 @@ FROM (
 			('Python',  'technical'),
 			('English', 'language')
 ) AS src (skill_name, skill_category)
+WHERE NOT EXISTS (
+	SELECT 1
+	FROM recruitment_agency.skill ski
+	WHERE LOWER(ski.skill_name) = LOWER(src.skill_name)
+)
 ON CONFLICT (skill_name) DO NOTHING;
 
 -- candidate (2 rows); person_id is found by email
@@ -521,7 +663,7 @@ FROM (
 	VALUES  ('aigerim.t@mail.kz',   'cv/aigerim_tulegen.pdf',   'job_board', TIMESTAMPTZ '2026-03-02 09:00:00+05'),
 			('n.ermekov@gmail.com', 'cv/nursultan_ermekov.pdf', 'referral',  TIMESTAMPTZ '2026-04-18 09:00:00+05')
 ) AS src (email, cv_url, source, registered_at)
-INNER JOIN recruitment_agency.person per ON per.email = src.email
+INNER JOIN recruitment_agency.person per ON LOWER(per.email) = LOWER(src.email)
 ON CONFLICT (person_id) DO NOTHING;
 
 -- company_representative (3 rows); the same person (Aruzhan) represents two companies in different periods
@@ -536,11 +678,11 @@ FROM (
 			('aruzhan.s@gmail.com',  '990140001234', 'Head of Engineering', DATE '2026-01-10', CAST(NULL AS DATE)),
 			('d.akhmetov@tengri.kz', '050240009876', 'Recruitment Lead',    DATE '2025-11-01', CAST(NULL AS DATE))
 ) AS src (email, registration_number, job_title, start_date, end_date)
-INNER JOIN recruitment_agency.person  per ON per.email               = src.email
-INNER JOIN recruitment_agency.company com ON com.registration_number = src.registration_number
+INNER JOIN recruitment_agency.person  per ON LOWER(per.email)               = LOWER(src.email)
+INNER JOIN recruitment_agency.company com ON UPPER(com.registration_number) = UPPER(src.registration_number)
 ON CONFLICT (person_id, company_id, start_date) DO NOTHING;
 
--- candidate_preferred_location (3 rows)
+-- candidate_preferred_location (3 rows); is_remote_ok is given explicitly because it differs per row
 INSERT INTO recruitment_agency.candidate_preferred_location (candidate_id, city_id, valid_from, valid_to, is_remote_ok)
 SELECT  can.candidate_id,
 		cit.city_id,
@@ -552,10 +694,10 @@ FROM (
 			('aigerim.t@mail.kz',   'Almaty', 'KZ', DATE '2026-09-01', CAST(NULL AS DATE), TRUE),
 			('n.ermekov@gmail.com', 'Almaty', 'KZ', DATE '2026-04-18', CAST(NULL AS DATE), FALSE)
 ) AS src (email, city_name, country_code, valid_from, valid_to, is_remote_ok)
-INNER JOIN recruitment_agency.person    per ON per.email        = src.email
-INNER JOIN recruitment_agency.candidate can ON can.person_id    = per.person_id
-INNER JOIN recruitment_agency.city      cit ON cit.city_name    = src.city_name AND
-											   cit.country_code = src.country_code
+INNER JOIN recruitment_agency.person    per ON LOWER(per.email)        = LOWER(src.email)
+INNER JOIN recruitment_agency.candidate can ON can.person_id           = per.person_id
+INNER JOIN recruitment_agency.city      cit ON LOWER(cit.city_name)    = LOWER(src.city_name) AND
+											   UPPER(cit.country_code) = UPPER(src.country_code)
 ON CONFLICT (candidate_id, city_id, valid_from) DO NOTHING;
 
 -- work_experience (2 rows); no UNIQUE key in the model, so duplicates are prevented with WHERE NOT EXISTS
@@ -570,14 +712,14 @@ FROM (
 	VALUES  ('aigerim.t@mail.kz',   'Halyk Bank', 'Data Intern', DATE '2024-06-01', DATE '2025-08-31',  'Reporting in SQL'),
 			('n.ermekov@gmail.com', 'Air Astana', 'BI Analyst',  DATE '2021-02-01', CAST(NULL AS DATE), 'Power BI dashboards')
 ) AS src (email, employer_name, job_title, start_date, end_date, description)
-INNER JOIN recruitment_agency.person    per ON per.email     = src.email
-INNER JOIN recruitment_agency.candidate can ON can.person_id = per.person_id
+INNER JOIN recruitment_agency.person    per ON LOWER(per.email) = LOWER(src.email)
+INNER JOIN recruitment_agency.candidate can ON can.person_id    = per.person_id
 WHERE NOT EXISTS (
 	SELECT 1
 	FROM recruitment_agency.work_experience wex
-	WHERE wex.candidate_id  = can.candidate_id AND
-		  wex.employer_name = src.employer_name AND
-		  wex.start_date    = src.start_date
+	WHERE wex.candidate_id         = can.candidate_id AND
+		  LOWER(wex.employer_name) = LOWER(src.employer_name) AND
+		  wex.start_date           = src.start_date
 );
 
 -- service_usage (2 rows); currency_code uses its DEFAULT 'KZT'
@@ -590,14 +732,14 @@ FROM (
 	VALUES  ('aigerim.t@mail.kz', 'resume_advice',  TIMESTAMPTZ '2026-03-05 10:00:00+05', 15000.00),
 			('aigerim.t@mail.kz', 'skills_testing', TIMESTAMPTZ '2026-09-04 09:00:00+05', 0.00)
 ) AS src (email, service_type, requested_at, price_charged)
-INNER JOIN recruitment_agency.person    per ON per.email     = src.email
-INNER JOIN recruitment_agency.candidate can ON can.person_id = per.person_id
+INNER JOIN recruitment_agency.person    per ON LOWER(per.email) = LOWER(src.email)
+INNER JOIN recruitment_agency.candidate can ON can.person_id    = per.person_id
 WHERE NOT EXISTS (
 	SELECT 1
 	FROM recruitment_agency.service_usage sus
-	WHERE sus.candidate_id = can.candidate_id AND
-		  sus.service_type = src.service_type AND
-		  sus.requested_at = src.requested_at
+	WHERE sus.candidate_id        = can.candidate_id AND
+		  LOWER(sus.service_type) = LOWER(src.service_type) AND
+		  sus.requested_at        = src.requested_at
 );
 
 -- service_usage_status_history (5 rows); the service is found by candidate + type + request time
@@ -613,11 +755,11 @@ FROM (
 			('aigerim.t@mail.kz', 'skills_testing', TIMESTAMPTZ '2026-09-04 09:00:00+05', 'scheduled', TIMESTAMPTZ '2026-09-04 12:00:00+05', 'Test on 6 Sep'),
 			('aigerim.t@mail.kz', 'skills_testing', TIMESTAMPTZ '2026-09-04 09:00:00+05', 'completed', TIMESTAMPTZ '2026-09-06 13:00:00+05', 'Score 82%')
 ) AS src (email, service_type, requested_at, status, changed_at, note)
-INNER JOIN recruitment_agency.person        per ON per.email        = src.email
-INNER JOIN recruitment_agency.candidate     can ON can.person_id    = per.person_id
-INNER JOIN recruitment_agency.service_usage sus ON sus.candidate_id = can.candidate_id AND
-												   sus.service_type = src.service_type AND
-												   sus.requested_at = src.requested_at
+INNER JOIN recruitment_agency.person        per ON LOWER(per.email)        = LOWER(src.email)
+INNER JOIN recruitment_agency.candidate     can ON can.person_id           = per.person_id
+INNER JOIN recruitment_agency.service_usage sus ON sus.candidate_id        = can.candidate_id AND
+												   LOWER(sus.service_type) = LOWER(src.service_type) AND
+												   sus.requested_at        = src.requested_at
 ON CONFLICT (service_usage_id, changed_at) DO NOTHING;
 
 -- candidate_skill (3 rows); a self-reported level has no service, a tested level points to the skills test.
@@ -634,12 +776,12 @@ FROM (
 			('aigerim.t@mail.kz',   'SQL',    DATE '2026-09-06', 4, 'skills_test',   TIMESTAMPTZ '2026-09-04 09:00:00+05'),
 			('n.ermekov@gmail.com', 'Python', DATE '2026-04-18', 5, 'self_reported', CAST(NULL AS TIMESTAMPTZ))
 ) AS src (email, skill_name, assessed_on, proficiency_level, assessment_source, test_requested_at)
-INNER JOIN recruitment_agency.person             per ON per.email        = src.email
-INNER JOIN recruitment_agency.candidate          can ON can.person_id    = per.person_id
-INNER JOIN recruitment_agency.skill              ski ON ski.skill_name   = src.skill_name
-LEFT OUTER JOIN recruitment_agency.service_usage sus ON sus.candidate_id = can.candidate_id AND
-														sus.service_type = 'skills_testing' AND
-														sus.requested_at = src.test_requested_at
+INNER JOIN recruitment_agency.person             per ON LOWER(per.email)        = LOWER(src.email)
+INNER JOIN recruitment_agency.candidate          can ON can.person_id           = per.person_id
+INNER JOIN recruitment_agency.skill              ski ON LOWER(ski.skill_name)   = LOWER(src.skill_name)
+LEFT OUTER JOIN recruitment_agency.service_usage sus ON sus.candidate_id        = can.candidate_id AND
+														LOWER(sus.service_type) = LOWER('skills_testing') AND
+														sus.requested_at        = src.test_requested_at
 ON CONFLICT (candidate_id, skill_id, assessed_on) DO NOTHING;
 
 -- job_posting, original postings (2 rows); currency_code uses its DEFAULT 'KZT'.
@@ -658,18 +800,19 @@ FROM (
 	VALUES  ('990140001234', 'Almaty', 'KZ', 'Data Analyst',      'Product analytics for the payments team', 'full_time', 600000.00, 900000.00, TIMESTAMPTZ '2026-08-20 09:00:00+05', DATE '2026-08-31'),
 			('050240009876', 'Astana', 'KZ', 'Logistics Analyst', 'Route and warehouse cost analysis',       'full_time', 500000.00, 700000.00, TIMESTAMPTZ '2026-09-10 09:00:00+05', DATE '2026-10-10')
 ) AS src (registration_number, city_name, country_code, job_title, description, employment_type, salary_min, salary_max, posted_at, closes_on)
-INNER JOIN recruitment_agency.company com ON com.registration_number = src.registration_number
-INNER JOIN recruitment_agency.city    cit ON cit.city_name           = src.city_name AND
-											 cit.country_code        = src.country_code
+INNER JOIN recruitment_agency.company com ON UPPER(com.registration_number) = UPPER(src.registration_number)
+INNER JOIN recruitment_agency.city    cit ON LOWER(cit.city_name)           = LOWER(src.city_name) AND
+											 UPPER(cit.country_code)        = UPPER(src.country_code)
 WHERE NOT EXISTS (
 	SELECT 1
 	FROM recruitment_agency.job_posting jpo
-	WHERE jpo.company_id = com.company_id AND
-		  jpo.job_title  = src.job_title AND
-		  jpo.posted_at  = src.posted_at
+	WHERE jpo.company_id       = com.company_id AND
+		  LOWER(jpo.job_title) = LOWER(src.job_title) AND
+		  jpo.posted_at        = src.posted_at
 );
 
--- job_posting, changed posting (1 row). The salary range was raised, so a new posting is created and linked to the old one. It is a separate statement because the old posting must already exist.
+-- job_posting, changed posting (1 row). The salary range was raised, so a new posting is created
+-- and linked to the old one. It is a separate statement because the old posting must already exist.
 INSERT INTO recruitment_agency.job_posting (company_id, previous_job_posting_id, city_id, job_title, description, employment_type, salary_min, salary_max, posted_at, closes_on)
 SELECT  com.company_id,
 		prv.job_posting_id,
@@ -684,18 +827,18 @@ SELECT  com.company_id,
 FROM (
 	VALUES  ('990140001234', 'Almaty', 'KZ', 'Data Analyst', 'Product analytics for the payments team, raised salary range', 'full_time', 700000.00, 1000000.00, TIMESTAMPTZ '2026-09-01 09:00:00+05', DATE '2026-09-30', TIMESTAMPTZ '2026-08-20 09:00:00+05')
 ) AS src (registration_number, city_name, country_code, job_title, description, employment_type, salary_min, salary_max, posted_at, closes_on, previous_posted_at)
-INNER JOIN recruitment_agency.company     com ON com.registration_number = src.registration_number
-INNER JOIN recruitment_agency.city        cit ON cit.city_name           = src.city_name AND
-												 cit.country_code        = src.country_code
-INNER JOIN recruitment_agency.job_posting prv ON prv.company_id          = com.company_id AND
-												 prv.job_title           = src.job_title AND
-												 prv.posted_at           = src.previous_posted_at
+INNER JOIN recruitment_agency.company     com ON UPPER(com.registration_number) = UPPER(src.registration_number)
+INNER JOIN recruitment_agency.city        cit ON LOWER(cit.city_name)           = LOWER(src.city_name) AND
+												 UPPER(cit.country_code)        = UPPER(src.country_code)
+INNER JOIN recruitment_agency.job_posting prv ON prv.company_id                 = com.company_id AND
+												 LOWER(prv.job_title)           = LOWER(src.job_title) AND
+												 prv.posted_at                  = src.previous_posted_at
 WHERE NOT EXISTS (
 	SELECT 1
 	FROM recruitment_agency.job_posting jpo
-	WHERE jpo.company_id = com.company_id AND
-		  jpo.job_title  = src.job_title AND
-		  jpo.posted_at  = src.posted_at
+	WHERE jpo.company_id       = com.company_id AND
+		  LOWER(jpo.job_title) = LOWER(src.job_title) AND
+		  jpo.posted_at        = src.posted_at
 );
 
 -- application (3 rows)
@@ -710,12 +853,12 @@ FROM (
 			('n.ermekov@gmail.com', '990140001234', 'Data Analyst',      TIMESTAMPTZ '2026-09-01 09:00:00+05', TIMESTAMPTZ '2026-09-04 12:00:00+05', 850000.00, CAST(NULL AS TEXT)),
 			('n.ermekov@gmail.com', '050240009876', 'Logistics Analyst', TIMESTAMPTZ '2026-09-10 09:00:00+05', TIMESTAMPTZ '2026-09-11 10:00:00+05', 650000.00, 'Five years of BI experience in transport')
 ) AS src (email, registration_number, job_title, posted_at, applied_at, expected_salary, cover_note)
-INNER JOIN recruitment_agency.person      per ON per.email               = src.email
-INNER JOIN recruitment_agency.candidate   can ON can.person_id           = per.person_id
-INNER JOIN recruitment_agency.company     com ON com.registration_number = src.registration_number
-INNER JOIN recruitment_agency.job_posting jpo ON jpo.company_id          = com.company_id AND
-												 jpo.job_title           = src.job_title AND
-												 jpo.posted_at           = src.posted_at
+INNER JOIN recruitment_agency.person      per ON LOWER(per.email)               = LOWER(src.email)
+INNER JOIN recruitment_agency.candidate   can ON can.person_id                  = per.person_id
+INNER JOIN recruitment_agency.company     com ON UPPER(com.registration_number) = UPPER(src.registration_number)
+INNER JOIN recruitment_agency.job_posting jpo ON jpo.company_id                 = com.company_id AND
+												 LOWER(jpo.job_title)           = LOWER(src.job_title) AND
+												 jpo.posted_at                  = src.posted_at
 ON CONFLICT (candidate_id, job_posting_id) DO NOTHING;
 
 -- application_status_history (9 rows); the application is found by candidate + posting
@@ -735,14 +878,14 @@ FROM (
 			('n.ermekov@gmail.com', '050240009876', 'Logistics Analyst', TIMESTAMPTZ '2026-09-10 09:00:00+05', 'interview',    TIMESTAMPTZ '2026-09-14 09:00:00+05', CAST(NULL AS TEXT)),
 			('n.ermekov@gmail.com', '050240009876', 'Logistics Analyst', TIMESTAMPTZ '2026-09-10 09:00:00+05', 'approved',     TIMESTAMPTZ '2026-09-20 16:00:00+05', 'Offer accepted')
 ) AS src (email, registration_number, job_title, posted_at, status, changed_at, comment)
-INNER JOIN recruitment_agency.person      per ON per.email               = src.email
-INNER JOIN recruitment_agency.candidate   can ON can.person_id           = per.person_id
-INNER JOIN recruitment_agency.company     com ON com.registration_number = src.registration_number
-INNER JOIN recruitment_agency.job_posting jpo ON jpo.company_id          = com.company_id AND
-												 jpo.job_title           = src.job_title AND
-												 jpo.posted_at           = src.posted_at
-INNER JOIN recruitment_agency.application app ON app.candidate_id        = can.candidate_id AND
-												 app.job_posting_id      = jpo.job_posting_id
+INNER JOIN recruitment_agency.person      per ON LOWER(per.email)               = LOWER(src.email)
+INNER JOIN recruitment_agency.candidate   can ON can.person_id                  = per.person_id
+INNER JOIN recruitment_agency.company     com ON UPPER(com.registration_number) = UPPER(src.registration_number)
+INNER JOIN recruitment_agency.job_posting jpo ON jpo.company_id                 = com.company_id AND
+												 LOWER(jpo.job_title)           = LOWER(src.job_title) AND
+												 jpo.posted_at                  = src.posted_at
+INNER JOIN recruitment_agency.application app ON app.candidate_id               = can.candidate_id AND
+												 app.job_posting_id             = jpo.job_posting_id
 ON CONFLICT (application_id, changed_at) DO NOTHING;
 
 -- interview (3 rows). The interviewer must represent the company of the posting on the interview day:
@@ -761,19 +904,19 @@ FROM (
 			('aigerim.t@mail.kz',   '990140001234', 'Data Analyst',      TIMESTAMPTZ '2026-09-01 09:00:00+05', 'aruzhan.s@gmail.com',  2, 'technical', TIMESTAMPTZ '2026-09-12 15:00:00+05', 60, 'passed', 'Strong SQL'),
 			('n.ermekov@gmail.com', '050240009876', 'Logistics Analyst', TIMESTAMPTZ '2026-09-10 09:00:00+05', 'd.akhmetov@tengri.kz', 1, 'onsite',    TIMESTAMPTZ '2026-09-16 11:00:00+05', 45, 'passed', 'Good knowledge of the transport domain')
 ) AS src (email, registration_number, job_title, posted_at, interviewer_email, round_number, interview_type, scheduled_at, duration_minutes, outcome, feedback)
-INNER JOIN recruitment_agency.person                 per ON per.email               = src.email
-INNER JOIN recruitment_agency.candidate              can ON can.person_id           = per.person_id
-INNER JOIN recruitment_agency.company                com ON com.registration_number = src.registration_number
-INNER JOIN recruitment_agency.job_posting            jpo ON jpo.company_id          = com.company_id AND
-															jpo.job_title           = src.job_title AND
-															jpo.posted_at           = src.posted_at
-INNER JOIN recruitment_agency.application            app ON app.candidate_id        = can.candidate_id AND
-															app.job_posting_id      = jpo.job_posting_id
-INNER JOIN recruitment_agency.person                 ivr ON ivr.email               = src.interviewer_email
-INNER JOIN recruitment_agency.company_representative rep ON rep.person_id           = ivr.person_id AND
-															rep.company_id          = jpo.company_id
+INNER JOIN recruitment_agency.person                 per ON LOWER(per.email)               = LOWER(src.email)
+INNER JOIN recruitment_agency.candidate              can ON can.person_id                  = per.person_id
+INNER JOIN recruitment_agency.company                com ON UPPER(com.registration_number) = UPPER(src.registration_number)
+INNER JOIN recruitment_agency.job_posting            jpo ON jpo.company_id                 = com.company_id AND
+															LOWER(jpo.job_title)           = LOWER(src.job_title) AND
+															jpo.posted_at                  = src.posted_at
+INNER JOIN recruitment_agency.application            app ON app.candidate_id               = can.candidate_id AND
+															app.job_posting_id             = jpo.job_posting_id
+INNER JOIN recruitment_agency.person                 ivr ON LOWER(ivr.email)               = LOWER(src.interviewer_email)
+INNER JOIN recruitment_agency.company_representative rep ON rep.person_id                  = ivr.person_id AND
+															rep.company_id                 = jpo.company_id
 WHERE rep.start_date <= CAST(src.scheduled_at AS DATE) AND
-	  (rep.end_date  >= CAST(src.scheduled_at AS DATE) OR rep.end_date IS NULL)
+	  (rep.end_date >= CAST(src.scheduled_at AS DATE) OR rep.end_date IS NULL)
 ON CONFLICT (application_id, round_number) DO NOTHING;
 
 -- placement (2 rows); currency_code uses its DEFAULT 'KZT', end_date and end_reason stay NULL (active).
@@ -787,19 +930,19 @@ FROM (
 	VALUES  ('aigerim.t@mail.kz',   '990140001234', 'Data Analyst',      TIMESTAMPTZ '2026-09-01 09:00:00+05', DATE '2026-10-01', 800000.00, 1600000.00),
 			('n.ermekov@gmail.com', '050240009876', 'Logistics Analyst', TIMESTAMPTZ '2026-09-10 09:00:00+05', DATE '2026-10-15', 650000.00, 1300000.00)
 ) AS src (email, registration_number, job_title, posted_at, start_date, agreed_salary, fee_amount)
-INNER JOIN recruitment_agency.person      per ON per.email               = src.email
-INNER JOIN recruitment_agency.candidate   can ON can.person_id           = per.person_id
-INNER JOIN recruitment_agency.company     com ON com.registration_number = src.registration_number
-INNER JOIN recruitment_agency.job_posting jpo ON jpo.company_id          = com.company_id AND
-												 jpo.job_title           = src.job_title AND
-												 jpo.posted_at           = src.posted_at
-INNER JOIN recruitment_agency.application app ON app.candidate_id        = can.candidate_id AND
-												 app.job_posting_id      = jpo.job_posting_id
+INNER JOIN recruitment_agency.person      per ON LOWER(per.email)               = LOWER(src.email)
+INNER JOIN recruitment_agency.candidate   can ON can.person_id                  = per.person_id
+INNER JOIN recruitment_agency.company     com ON UPPER(com.registration_number) = UPPER(src.registration_number)
+INNER JOIN recruitment_agency.job_posting jpo ON jpo.company_id                 = com.company_id AND
+												 LOWER(jpo.job_title)           = LOWER(src.job_title) AND
+												 jpo.posted_at                  = src.posted_at
+INNER JOIN recruitment_agency.application app ON app.candidate_id               = can.candidate_id AND
+												 app.job_posting_id             = jpo.job_posting_id
 WHERE EXISTS (
 	SELECT 1
 	FROM recruitment_agency.application_status_history ash
 	WHERE ash.application_id = app.application_id AND
-		  ash.status         = 'approved'
+		  LOWER(ash.status)  = LOWER('approved')
 )
 ON CONFLICT (application_id) DO NOTHING;
 
@@ -808,15 +951,13 @@ COMMIT;
 
 /*
    STEP 5. record_ts
-
    A NOT NULL column is added to tables that already contain rows. This works only because the
-   column has a DEFAULT: PostgreSQL writes the default value into all existing rows. 
-   
-   Without the DEFAULT the statement would fail with
-   ERROR: column "record_ts" of relation "person" contains null values  (SQLSTATE 23502).
-   ADD COLUMN IF NOT EXISTS keeps the statement rerunnable and does not overwrite the dates
-   of rows loaded on an earlier day.
-   */
+   column has a DEFAULT: PostgreSQL writes the default value into all existing rows. Without the
+   DEFAULT the statement would fail with
+     ERROR: column "record_ts" of relation "person" contains null values (SQLSTATE 23502).
+   ADD COLUMN IF NOT EXISTS keeps the statement rerunnable and does not overwrite the dates of
+   rows loaded on an earlier day.
+*/
 
 ALTER TABLE recruitment_agency.person
 	ADD COLUMN IF NOT EXISTS record_ts DATE NOT NULL DEFAULT CURRENT_DATE;
@@ -869,16 +1010,15 @@ ALTER TABLE recruitment_agency.placement
 
 /*
    STEP 6. CHECK THAT record_ts IS SET FOR THE EXISTING ROWS
-   
-   For every table: row_count must be equal to record_ts_filled_count (COUNT(column) skips NULLs),
+   For every table row_count must be equal to record_ts_filled_count (COUNT(column) skips NULLs),
    every table must have at least 2 rows, and the total is 52 rows.
    No WHERE clause: the check must cover all rows of every table.
 */
 
-SELECT  'person'                        AS table_name,
-		COUNT(*)                        AS row_count,
-		COUNT(per.record_ts)            AS record_ts_filled_count,
-		MIN(per.record_ts)              AS record_ts_min
+SELECT  'person'                AS table_name,
+		COUNT(*)                AS row_count,
+		COUNT(per.record_ts)    AS record_ts_filled_count,
+		MIN(per.record_ts)      AS record_ts_min
 FROM recruitment_agency.person per
 UNION ALL
 SELECT  'company',
